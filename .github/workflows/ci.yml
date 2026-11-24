@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+
+jobs:
+  kernel-patches:
+    name: 커널 패치 (적용, checkpatch, 컴파일)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 빌드 도구 설치
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq flex bison bc libelf-dev libssl-dev
+      - name: 커널 소스 캐시
+        uses: actions/cache@v4
+        with:
+          path: .ci/linux-6.18.tar.xz
+          key: linux-6.18-tarball
+      - run: scripts/ci-kernel.sh
+
+  bench:
+    name: 벤치마크 컴파일
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: bench/*.c 컴파일 (경고도 실패)
+        run: |
+          shopt -s nullglob
+          for f in bench/*.c; do
+            echo "== $f"
+            gcc -O2 -Wall -Werror -o /tmp/$(basename "$f" .c) "$f"
+          done
+
+  results:
+    name: 측정 결과 형식
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-results.sh
