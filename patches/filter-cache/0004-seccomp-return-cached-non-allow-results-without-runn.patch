@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minchan Kwon <tronve@naver.com>
+Date: Thu, 26 Nov 2026 08:38:24 +0000
+Subject: [PATCH] seccomp: return cached non-allow results without running
+ filters
+
+Look up the deny cache after the allow cache in seccomp_run_filters()
+and return the cached result directly on a hit. Since @match stays NULL
+in that case, pass the log flag of the filter that produced the result
+back to __seccomp_filter() so that audit logging is unchanged.
+---
+ kernel/seccomp.c | 70 +++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index cb9754376..0c8209050 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -193,6 +193,13 @@ struct action_cache {
+ #else
+ struct action_cache { };
+ 
++static inline bool seccomp_cache_check_deny(const struct seccomp_filter *sfilter,
++					    const struct seccomp_data *sd,
++					    u32 *ret, bool *log)
++{
++	return false;
++}
++
+ static inline bool seccomp_cache_check_allow(const struct seccomp_filter *sfilter,
+ 					     const struct seccomp_data *sd)
+ {
+@@ -408,6 +415,56 @@ static inline bool seccomp_cache_check_allow(const struct seccomp_filter *sfilte
+ 	WARN_ON_ONCE(true);
+ 	return false;
+ }
++
++static inline bool seccomp_cache_check_deny_entry(const struct seccomp_cache_entry *deny,
++						  size_t size, int syscall_nr,
++						  u32 *ret, bool *log)
++{
++	if (unlikely(syscall_nr < 0 || syscall_nr >= size))
++		return false;
++	syscall_nr = array_index_nospec(syscall_nr, size);
++
++	if (!deny[syscall_nr].valid)
++		return false;
++
++	*ret = deny[syscall_nr].ret;
++	*log = deny[syscall_nr].log;
++	return true;
++}
++
++/**
++ * seccomp_cache_check_deny - lookup the cached non-allow result
++ * @sfilter: The seccomp filter
++ * @sd: The seccomp data to lookup the cache with
++ * @ret: Set to the cached result on a hit
++ * @log: Set to the log flag of the filter that produced @ret on a hit
++ *
++ * Returns true if the syscall has a cached constant non-allow result.
++ */
++static inline bool seccomp_cache_check_deny(const struct seccomp_filter *sfilter,
++					    const struct seccomp_data *sd,
++					    u32 *ret, bool *log)
++{
++	int syscall_nr = sd->nr;
++	const struct action_cache *cache = &sfilter->cache;
++
++#ifndef SECCOMP_ARCH_COMPAT
++	return seccomp_cache_check_deny_entry(cache->deny_native,
++			      SECCOMP_ARCH_NATIVE_NR,
++			      syscall_nr, ret, log);
++#else
++	if (likely(sd->arch == SECCOMP_ARCH_NATIVE))
++		return seccomp_cache_check_deny_entry(cache->deny_native,
++				      SECCOMP_ARCH_NATIVE_NR,
++				      syscall_nr, ret, log);
++	if (likely(sd->arch == SECCOMP_ARCH_COMPAT))
++		return seccomp_cache_check_deny_entry(cache->deny_compat,
++				      SECCOMP_ARCH_COMPAT_NR,
++				      syscall_nr, ret, log);
++#endif /* SECCOMP_ARCH_COMPAT  */
++
++	return false;
++}
+ #endif /* SECCOMP_ARCH_NATIVE */
+ 
+ #define ACTION_ONLY(ret) ((s32)((ret) & (SECCOMP_RET_ACTION_FULL)))
+@@ -417,11 +474,12 @@ static inline bool seccomp_cache_check_allow(const struct seccomp_filter *sfilte
+  * @match: stores struct seccomp_filter that resulted in the return value,
+  *         unless filter returned SECCOMP_RET_ALLOW, in which case it will
+  *         be unchanged.
+- *
++ * @log: set to the log flag of the filter that produced the return value
++ *       when it comes from the cache, otherwise unchanged.
+  * Returns valid seccomp BPF response codes.
+  */
+ static u32 seccomp_run_filters(const struct seccomp_data *sd,
+-			       struct seccomp_filter **match)
++			       struct seccomp_filter **match, bool *log)
+ {
+ 	u32 ret = SECCOMP_RET_ALLOW;
+ 	/* Make sure cross-thread synced filter points somewhere sane. */
+@@ -435,6 +493,9 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd,
+ 	if (seccomp_cache_check_allow(f, sd))
+ 		return SECCOMP_RET_ALLOW;
+ 
++	if (seccomp_cache_check_deny(f, sd, &ret, log))
++		return ret;
++
+ 	/*
+ 	 * All filters in the list are evaluated and the lowest BPF return
+ 	 * value always takes priority (ignoring the DATA).
+@@ -1393,6 +1454,7 @@ static int __seccomp_filter(int this_syscall, const bool recheck_after_trace)
+ 	u32 filter_ret, action;
+ 	struct seccomp_data sd;
+ 	struct seccomp_filter *match = NULL;
++	bool cache_log = false;
+ 	int data;
+ 
+ 	/*
+@@ -1403,7 +1465,7 @@ static int __seccomp_filter(int this_syscall, const bool recheck_after_trace)
+ 
+ 	populate_seccomp_data(&sd);
+ 
+-	filter_ret = seccomp_run_filters(&sd, &match);
++	filter_ret = seccomp_run_filters(&sd, &match, &cache_log);
+ 	data = filter_ret & SECCOMP_RET_DATA;
+ 	action = filter_ret & SECCOMP_RET_ACTION_FULL;
+ 
+@@ -1505,7 +1567,7 @@ static int __seccomp_filter(int this_syscall, const bool recheck_after_trace)
+ 	unreachable();
+ 
+ skip:
+-	seccomp_log(this_syscall, 0, action, match ? match->log : false);
++	seccomp_log(this_syscall, 0, action, match ? match->log : cache_log);
+ 	return -1;
+ }
+ #else

@@ -151,7 +151,7 @@ git am ~/repo/patches/auto-sync/*.patch      # 해당 영역에 이미 합쳐진
 ```bash
 cd ~/proj/linux-6.18
 rm -f ~/repo/patches/auto-sync/*.patch
-git format-patch --zero-commit --no-signature base..HEAD -o ~/repo/patches/auto-sync/
+git format-patch -N --zero-commit --no-signature base..HEAD -o ~/repo/patches/auto-sync/
 
 cd ~/repo
 git add patches/auto-sync
@@ -159,7 +159,7 @@ git commit -m "feat(policy): 방향별 dir_policy 상태와 OFF/ON 전환 추가
 git push -u origin feat/12-dir-policy-state
 ```
 
-- `--zero-commit`, `--no-signature`를 쓰면 다시 내보내도 바뀌지 않은 패치 파일은 그대로라서, PR에는 새로 추가된 패치만 보인다.
+- `-N`, `--zero-commit`, `--no-signature`를 쓰면 다시 내보내도 바뀌지 않은 패치 파일은 그대로라서, PR에는 새로 추가된 패치만 보인다.
 - `auto-sync`는 B와 C가 같이 쓴다. B는 C의 공통 틀이 `develop`에 합쳐진 뒤 그 위에서 시작한다.
 - 두 영역 모두 `seccomp.c`를 고치므로, 통합할 때는 `auto-sync` → `filter-cache` 순서로 적용한다. 충돌하면 뒤에 합쳐지는 쪽이 자기 패치를 고친다.
 

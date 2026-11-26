@@ -1,0 +1,15 @@
+condition,run,metric,value
+F2,1,allow_ns@0,102.9
+F2,1,deny_ns@0,83.6
+F2,1,allow_ns@7,106.3
+F2,1,deny_ns@7,103.5
+F2,1,allow_ns@107,103.2
+F2,1,deny_ns@107,114.4
+F2,1,allow_ns@507,106.6
+F2,1,deny_ns@507,98.0
+F2,1,allow_ns@1007,101.3
+F2,1,deny_ns@1007,98.2
+F2,1,allow_ns@2007,106.5
+F2,1,deny_ns@2007,101.9
+F2,1,allow_ns@4007,105.8
+F2,1,deny_ns@4007,99.4
