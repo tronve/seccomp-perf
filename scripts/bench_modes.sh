@@ -5,7 +5,7 @@
 #   - bench/deny_bench.c: 길이를 바꾼 인공 필터에서 허용/거부 지연
 #   - bench/bpf_bench.c + bench/filters/docker_default_<arch>.bpf: Docker 기본 필터에서 허용/거부 지연
 #   필요: gcc, sudo (cache_mode를 바꾸기 위해)
-# 결과: <결과 폴더>/bench.csv (condition,run,metric,value), summary.csv (평균, 최소, 최대), README.md
+# 결과: <결과 폴더>/bench.csv (condition,run,metric,value), summary.txt (평균, 최소, 최대), README.md
 set -euo pipefail
 
 RUNS=${1:-10}
@@ -63,7 +63,7 @@ done
 		if (!(k in hi) || $4 > hi[k]) hi[k] = $4
 	} END { for (k in n) printf "%s,%.1f,%.1f,%.1f,%d\n", k, s[k] / n[k], lo[k], hi[k], n[k] }' "$CSV" |
 		sort -t, -k2,2V -k1,1
-} > "$OUT/summary.csv"
+} > "$OUT/summary.txt"
 
 FNAME=${FILTER:+bench/filters/$(basename "$FILTER")}
 FNAME=${FNAME:-측정 안 함}
@@ -76,12 +76,12 @@ cat > "$OUT/README.md" <<EOT
 - 반복: ${RUNS}회, 매 회 F1과 F2의 순서를 무작위로 섞음
 - 지표: allow_ns@N, deny_ns@N = 인공 필터(명령 N개)에서 getppid, getpgid 1회 지연 (bench/deny_bench.c)
         docker_allow_ns, docker_deny_ns = Docker 기본 필터에서 getppid, acct 1회 지연 (bench/bpf_bench.c, ${FNAME})
-- 요약: summary.csv (평균, 최소, 최대). 걸린 시간 $(( $(date +%s) - start ))초
+- 요약: summary.txt (평균, 최소, 최대). 걸린 시간 $(( $(date +%s) - start ))초
 EOT
 
 echo
 awk -F, '$1 == "condition" || $2 ~ /docker|@0$|@507$|@4007$/ {
 	printf "%-10s %-18s %8s %8s %8s\n", $1, $2, $3, $4, $5
-}' "$OUT/summary.csv"
+}' "$OUT/summary.txt"
 echo
 echo "결과: $OUT"
