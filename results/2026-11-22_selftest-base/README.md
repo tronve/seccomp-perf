@@ -6,3 +6,4 @@
 | 담당 | 커널 | VM | 결과 |
 | --- | --- | --- | --- |
 | 이준원 | 6.18.0-seccomp | UTM arm64, 4 vCPU, 4GB | PASSED 111/111 (pass 99, skip 12: 전부 UPROBE, ARM64에는 해당 시스템 콜이 없어 정상) |
+| 임대철 | 6.18.0-seccomp | VirtualBox x86_64, 3 vCPU, 3.8GB | PASSED 111/111 (pass 111, skip 0) |
