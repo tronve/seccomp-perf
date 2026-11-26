@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minchan Kwon <tronve@naver.com>
+Date: Thu, 26 Nov 2026 12:52:18 +0000
+Subject: [PATCH] seccomp: build the allow and deny caches in a single pass
+
+seccomp_cache_prepare() emulated the filter twice for every syscall
+number: once for the allow bitmap and once for the deny cache. Since
+seccomp_emulate_const() returns the constant result itself, fill both
+caches from a single emulation and drop seccomp_cache_prepare_bitmap()
+and seccomp_is_const_allow().
+
+The resulting caches are unchanged.
+---
+ kernel/seccomp.c | 76 +++++++++---------------------------------------
+ 1 file changed, 13 insertions(+), 63 deletions(-)
+
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 1d24ce180..27fa12b75 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -939,21 +939,6 @@ static bool seccomp_emulate_const(struct sock_fprog_kern *fprog,
+ 	return false;
+ }
+ 
+-/**
+- * seccomp_is_const_allow - check if filter is constant allow with given data
+- * @fprog: The BPF programs
+- * @sd: The seccomp data to check against, only syscall number and arch
+- *      number are considered constant.
+- */
+-static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
+-				   struct seccomp_data *sd)
+-{
+-	u32 ret;
+-
+-	return seccomp_emulate_const(fprog, sd, &ret) &&
+-	       ret == SECCOMP_RET_ALLOW;
+-}
+-
+ /**
+  * seccomp_cache_deny_ok - check if a constant result may be cached
+  * @ret: A constant filter result
+@@ -980,8 +965,9 @@ static bool seccomp_cache_deny_ok(u32 ret)
+ }
+ 
+ /**
+- * seccomp_cache_prepare_deny - find syscalls with a constant non-allow result
++ * seccomp_cache_prepare_arch - find syscalls with a constant result
+  * @sfilter: The seccomp filter being attached
++ * @allow: The allow bitmap of @sfilter to fill, for one architecture
+  * @deny: The deny cache of @sfilter to fill, for one architecture
+  * @allow_prev: The allow bitmap of the previous filter, or NULL if none
+  * @deny_prev: The deny cache of the previous filter, or NULL if none
+@@ -992,7 +978,8 @@ static bool seccomp_cache_deny_ok(u32 ret)
+  * way seccomp_run_filters() does: an older filter's result wins only if
+  * its action is strictly lower.
+  */
+-static void seccomp_cache_prepare_deny(struct seccomp_filter *sfilter,
++static void seccomp_cache_prepare_arch(struct seccomp_filter *sfilter,
++				       unsigned long *allow,
+ 				       struct seccomp_cache_entry *deny,
+ 				       const unsigned long *allow_prev,
+ 				       const struct seccomp_cache_entry *deny_prev,
+@@ -1027,6 +1014,11 @@ static void seccomp_cache_prepare_deny(struct seccomp_filter *sfilter,
+ 			log = sfilter->log;
+ 		}
+ 
++		if (ret == SECCOMP_RET_ALLOW) {
++			__set_bit(nr, allow);
++			continue;
++		}
++
+ 		if (!seccomp_cache_deny_ok(ret))
+ 			continue;
+ 
+@@ -1036,42 +1028,6 @@ static void seccomp_cache_prepare_deny(struct seccomp_filter *sfilter,
+ 	}
+ }
+ 
+-static void seccomp_cache_prepare_bitmap(struct seccomp_filter *sfilter,
+-					 void *bitmap, const void *bitmap_prev,
+-					 size_t bitmap_size, int arch)
+-{
+-	struct sock_fprog_kern *fprog = sfilter->prog->orig_prog;
+-	struct seccomp_data sd;
+-	int nr;
+-
+-	if (bitmap_prev) {
+-		/* The new filter must be as restrictive as the last. */
+-		bitmap_copy(bitmap, bitmap_prev, bitmap_size);
+-	} else {
+-		/* Before any filters, all syscalls are always allowed. */
+-		bitmap_fill(bitmap, bitmap_size);
+-	}
+-
+-	for (nr = 0; nr < bitmap_size; nr++) {
+-		/* No bitmap change: not a cacheable action. */
+-		if (!test_bit(nr, bitmap))
+-			continue;
+-
+-		sd.nr = nr;
+-		sd.arch = arch;
+-
+-		/* No bitmap change: continue to always allow. */
+-		if (seccomp_is_const_allow(fprog, &sd))
+-			continue;
+-
+-		/*
+-		 * Not a cacheable action: always run filters.
+-		 * atomic clear_bit() not needed, filter not visible yet.
+-		 */
+-		__clear_bit(nr, bitmap);
+-	}
+-}
+-
+ /**
+  * seccomp_cache_prepare - emulate the filter to find cacheable syscalls
+  * @sfilter: The seccomp filter
+@@ -1084,22 +1040,16 @@ static void seccomp_cache_prepare(struct seccomp_filter *sfilter)
+ 	const struct action_cache *cache_prev =
+ 		sfilter->prev ? &sfilter->prev->cache : NULL;
+ 
+-	seccomp_cache_prepare_bitmap(sfilter, cache->allow_native,
+-				     cache_prev ? cache_prev->allow_native : NULL,
+-				     SECCOMP_ARCH_NATIVE_NR,
+-				     SECCOMP_ARCH_NATIVE);
+-	seccomp_cache_prepare_deny(sfilter, cache->deny_native,
++	seccomp_cache_prepare_arch(sfilter, cache->allow_native,
++				   cache->deny_native,
+ 				   cache_prev ? cache_prev->allow_native : NULL,
+ 				   cache_prev ? cache_prev->deny_native : NULL,
+ 				   SECCOMP_ARCH_NATIVE_NR,
+ 				   SECCOMP_ARCH_NATIVE);
+ 
+ #ifdef SECCOMP_ARCH_COMPAT
+-	seccomp_cache_prepare_bitmap(sfilter, cache->allow_compat,
+-				     cache_prev ? cache_prev->allow_compat : NULL,
+-				     SECCOMP_ARCH_COMPAT_NR,
+-				     SECCOMP_ARCH_COMPAT);
+-	seccomp_cache_prepare_deny(sfilter, cache->deny_compat,
++	seccomp_cache_prepare_arch(sfilter, cache->allow_compat,
++				   cache->deny_compat,
+ 				   cache_prev ? cache_prev->allow_compat : NULL,
+ 				   cache_prev ? cache_prev->deny_compat : NULL,
+ 				   SECCOMP_ARCH_COMPAT_NR,

@@ -1,9 +1,10 @@
 /* cache_fuzz.c - 거부 캐시 정확성 시험
  *
  * 무작위 seccomp 필터를 1~4개 쌓은 자식 프로세스에서 시스템 콜 하나를 부르고,
- * 그 결과(성공, errno, TRAP 시그널의 데이터, KILL)를 cache_mode 1과 2에서 비교한다.
- *   mode 1: 거부는 필터를 실제로 실행 (정답)
- *   mode 2: 거부는 거부 캐시에서 답 (검사 대상)
+ * 그 결과(성공, errno, TRAP 시그널의 데이터, KILL)를 cache_mode 0, 1, 2에서 비교한다.
+ *   mode 0: 캐시를 보지 않고 항상 필터를 실행 (정답)
+ *   mode 1: 허용 캐시 사용 (검사 대상)
+ *   mode 2: 허용 + 거부 캐시 사용 (검사 대상)
  *
  * 사용법: sudo ./cache_fuzz [시험 횟수] [시작 seed]
  *   /proc/sys/kernel/seccomp/cache_mode가 없으면 모드를 바꾸지 않고 같은 조건을 두 번 비교한다
@@ -204,26 +205,27 @@ int main(int argc, char **argv)
 			gen_filter(&fs[i]);
 
 		for (i = 0; i < NTARGETS; i++) {
-			int a, b;
+			int out[3], m;
 			char ba[64], bb[64];
 
-			if (have_mode)
-				set_mode(1);
-			a = run_child(fs, nf, targets[i]);
-			if (have_mode)
-				set_mode(2);
-			b = run_child(fs, nf, targets[i]);
+			for (m = 0; m < 3; m++) {
+				if (have_mode)
+					set_mode(m);
+				out[m] = run_child(fs, nf, targets[i]);
+			}
 			total++;
 
-			if (a >= 250 && a < 1000) {
-				printf("시험 장치 오류: seed %llu, nr %ld, %s\n", seed, targets[i], describe(a, ba));
+			if (out[0] >= 250 && out[0] < 1000) {
+				printf("시험 장치 오류: seed %llu, nr %ld, %s\n", seed, targets[i], describe(out[0], ba));
 				return 2;
 			}
-			kinds[a == OUT_SUCCESS ? 0 : a >= 1000 ? 3 : a >= OUT_TRAP_BASE ? 2 : 1]++;
-			if (a != b) {
-				bad++;
-				printf("불일치: seed %llu, 필터 %d개, nr %ld: mode1 %s, mode2 %s\n",
-				       seed, nf, targets[i], describe(a, ba), describe(b, bb));
+			kinds[out[0] == OUT_SUCCESS ? 0 : out[0] >= 1000 ? 3 : out[0] >= OUT_TRAP_BASE ? 2 : 1]++;
+			for (m = 1; m < 3; m++) {
+				if (out[m] != out[0]) {
+					bad++;
+					printf("불일치: seed %llu, 필터 %d개, nr %ld: mode0 %s, mode%d %s\n",
+					       seed, nf, targets[i], describe(out[0], ba), m, describe(out[m], bb));
+				}
 			}
 		}
 	}

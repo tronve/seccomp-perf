@@ -1,0 +1,15 @@
+condition,run,metric,value
+P5,1,attach_us@pad0,101.5
+P5,1,attach_us@pad100,282.3
+P5,1,attach_us@pad500,1025.8
+P5,1,attach_us@pad1000,1840.1
+P5,1,attach_us@pad2000,3118.2
+P5,1,attach_us@pad4000,5180.6
+P5,1,attach_us@docker,920.8
+P6,1,attach_us@pad0,84.9
+P6,1,attach_us@pad100,209.6
+P6,1,attach_us@pad500,600.7
+P6,1,attach_us@pad1000,1091.6
+P6,1,attach_us@pad2000,1883.4
+P6,1,attach_us@pad4000,3536.7
+P6,1,attach_us@docker,566.2
