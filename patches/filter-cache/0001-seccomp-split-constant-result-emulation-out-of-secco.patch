@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minchan Kwon <tronve@naver.com>
+Date: Thu, 26 Nov 2026 01:17:33 +0000
+Subject: [PATCH] seccomp: split constant-result emulation out of
+ seccomp_is_const_allow
+
+Let the filter emulation return the constant result itself instead of
+only whether it is SECCOMP_RET_ALLOW, so that a later patch can cache
+constant deny results as well. seccomp_is_const_allow() becomes a
+wrapper and the allow cache behaves exactly as before.
+
+No functional change.
+---
+ kernel/seccomp.c | 33 +++++++++++++++++++++++++++------
+ 1 file changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 25f62867a..599f39685 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -762,13 +762,16 @@ static bool seccomp_uprobe_exception(struct seccomp_data *sd)
+ }
+ 
+ /**
+- * seccomp_is_const_allow - check if filter is constant allow with given data
++ * seccomp_emulate_const - emulate the filter with constant syscall data
+  * @fprog: The BPF programs
+  * @sd: The seccomp data to check against, only syscall number and arch
+  *      number are considered constant.
++ * @ret: Set to the filter's return value when the result is constant.
++ *
++ * Returns true if the filter's result depends only on @sd->nr and @sd->arch.
+  */
+-static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
+-				   struct seccomp_data *sd)
++static bool seccomp_emulate_const(struct sock_fprog_kern *fprog,
++				  struct seccomp_data *sd, u32 *ret)
+ {
+ 	unsigned int reg_value = 0;
+ 	unsigned int pc;
+@@ -778,8 +781,10 @@ static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
+ 		return false;
+ 
+ 	/* Our single exception to filtering. */
+-	if (seccomp_uprobe_exception(sd))
++	if (seccomp_uprobe_exception(sd)) {
++		*ret = SECCOMP_RET_ALLOW;
+ 		return true;
++	}
+ 
+ 	for (pc = 0; pc < fprog->len; pc++) {
+ 		struct sock_filter *insn = &fprog->filter[pc];
+@@ -801,8 +806,9 @@ static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
+ 			}
+ 			break;
+ 		case BPF_RET | BPF_K:
+-			/* reached return with constant values only, check allow */
+-			return k == SECCOMP_RET_ALLOW;
++			/* reached return with constant values only */
++			*ret = k;
++			return true;
+ 		case BPF_JMP | BPF_JA:
+ 			pc += insn->k;
+ 			break;
+@@ -844,6 +850,21 @@ static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
+ 	return false;
+ }
+ 
++/**
++ * seccomp_is_const_allow - check if filter is constant allow with given data
++ * @fprog: The BPF programs
++ * @sd: The seccomp data to check against, only syscall number and arch
++ *      number are considered constant.
++ */
++static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
++				   struct seccomp_data *sd)
++{
++	u32 ret;
++
++	return seccomp_emulate_const(fprog, sd, &ret) &&
++	       ret == SECCOMP_RET_ALLOW;
++}
++
+ static void seccomp_cache_prepare_bitmap(struct seccomp_filter *sfilter,
+ 					 void *bitmap, const void *bitmap_prev,
+ 					 size_t bitmap_size, int arch)
