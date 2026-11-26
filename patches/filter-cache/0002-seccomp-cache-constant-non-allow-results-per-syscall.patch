@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minchan Kwon <tronve@naver.com>
+Date: Thu, 26 Nov 2026 07:24:59 +0000
+Subject: [PATCH] seccomp: cache constant non-allow results per syscall
+
+When a filter is attached, also record the syscalls whose combined
+result is a constant non-allow action (KILL, TRAP, ERRNO or LOG),
+together with the log flag of the filter that produced it. Results are
+combined with the previous filters the same way seccomp_run_filters()
+does: an older filter wins only if its action is strictly lower.
+
+The cache is not used yet. No functional change.
+---
+ kernel/seccomp.c | 111 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 111 insertions(+)
+
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 599f39685..1ff7b8b5c 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -154,6 +154,19 @@ struct notification {
+ };
+ 
+ #ifdef SECCOMP_ARCH_NATIVE
++/**
++ * struct seccomp_cache_entry - cached constant non-allow result of a syscall
++ * @valid: Whether @ret holds a constant result for this syscall.
++ * @log: Whether the filter that produced @ret was installed with
++ *	 SECCOMP_FILTER_FLAG_LOG.
++ * @ret: The combined filter result, action and data.
++ */
++struct seccomp_cache_entry {
++	bool valid;
++	bool log;
++	u32 ret;
++};
++
+ /**
+  * struct action_cache - per-filter cache of seccomp actions per
+  * arch/syscall pair
+@@ -164,11 +177,17 @@ struct notification {
+  * @allow_compat: A bitmap where each bit represents whether the
+  *		  filter will always allow the syscall, for the
+  *		  compat architecture.
++ * @deny_native: Per-syscall constant non-allow results of the filter,
++ *		 for the native architecture.
++ * @deny_compat: Per-syscall constant non-allow results of the filter,
++ *		 for the compat architecture.
+  */
+ struct action_cache {
+ 	DECLARE_BITMAP(allow_native, SECCOMP_ARCH_NATIVE_NR);
++	struct seccomp_cache_entry deny_native[SECCOMP_ARCH_NATIVE_NR];
+ #ifdef SECCOMP_ARCH_COMPAT
+ 	DECLARE_BITMAP(allow_compat, SECCOMP_ARCH_COMPAT_NR);
++	struct seccomp_cache_entry deny_compat[SECCOMP_ARCH_COMPAT_NR];
+ #endif
+ };
+ #else
+@@ -865,6 +884,88 @@ static bool seccomp_is_const_allow(struct sock_fprog_kern *fprog,
+ 	       ret == SECCOMP_RET_ALLOW;
+ }
+ 
++/**
++ * seccomp_cache_deny_ok - check if a constant result may be cached
++ * @ret: A constant filter result
++ *
++ * Returns true for actions that __seccomp_filter() handles using only the
++ * result value and the log flag of the matching filter.
++ */
++static bool seccomp_cache_deny_ok(u32 ret)
++{
++	switch (ret & SECCOMP_RET_ACTION_FULL) {
++	case SECCOMP_RET_KILL_PROCESS:
++		return true;
++	case SECCOMP_RET_KILL_THREAD:
++		return true;
++	case SECCOMP_RET_TRAP:
++		return true;
++	case SECCOMP_RET_ERRNO:
++		return true;
++	case SECCOMP_RET_LOG:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/**
++ * seccomp_cache_prepare_deny - find syscalls with a constant non-allow result
++ * @sfilter: The seccomp filter being attached
++ * @deny: The deny cache of @sfilter to fill, for one architecture
++ * @allow_prev: The allow bitmap of the previous filter, or NULL if none
++ * @deny_prev: The deny cache of the previous filter, or NULL if none
++ * @size: The number of syscalls of the architecture
++ * @arch: The architecture to emulate with
++ *
++ * The cached result combines @sfilter with all previous filters the same
++ * way seccomp_run_filters() does: an older filter's result wins only if
++ * its action is strictly lower.
++ */
++static void seccomp_cache_prepare_deny(struct seccomp_filter *sfilter,
++				       struct seccomp_cache_entry *deny,
++				       const unsigned long *allow_prev,
++				       const struct seccomp_cache_entry *deny_prev,
++				       size_t size, int arch)
++{
++	struct sock_fprog_kern *fprog = sfilter->prog->orig_prog;
++	struct seccomp_data sd;
++	int nr;
++
++	for (nr = 0; nr < size; nr++) {
++		u32 prev_ret, ret;
++		bool prev_log, log;
++
++		if (!allow_prev || test_bit(nr, allow_prev)) {
++			prev_ret = SECCOMP_RET_ALLOW;
++			prev_log = false;
++		} else if (deny_prev[nr].valid) {
++			prev_ret = deny_prev[nr].ret;
++			prev_log = deny_prev[nr].log;
++		} else {
++			continue;
++		}
++
++		sd.nr = nr;
++		sd.arch = arch;
++		if (!seccomp_emulate_const(fprog, &sd, &ret))
++			continue;
++		if (ACTION_ONLY(prev_ret) < ACTION_ONLY(ret)) {
++			ret = prev_ret;
++			log = prev_log;
++		} else {
++			log = sfilter->log;
++		}
++
++		if (!seccomp_cache_deny_ok(ret))
++			continue;
++
++		deny[nr].valid = true;
++		deny[nr].log = log;
++		deny[nr].ret = ret;
++	}
++}
++
+ static void seccomp_cache_prepare_bitmap(struct seccomp_filter *sfilter,
+ 					 void *bitmap, const void *bitmap_prev,
+ 					 size_t bitmap_size, int arch)
+@@ -917,12 +1018,22 @@ static void seccomp_cache_prepare(struct seccomp_filter *sfilter)
+ 				     cache_prev ? cache_prev->allow_native : NULL,
+ 				     SECCOMP_ARCH_NATIVE_NR,
+ 				     SECCOMP_ARCH_NATIVE);
++	seccomp_cache_prepare_deny(sfilter, cache->deny_native,
++				   cache_prev ? cache_prev->allow_native : NULL,
++				   cache_prev ? cache_prev->deny_native : NULL,
++				   SECCOMP_ARCH_NATIVE_NR,
++				   SECCOMP_ARCH_NATIVE);
+ 
+ #ifdef SECCOMP_ARCH_COMPAT
+ 	seccomp_cache_prepare_bitmap(sfilter, cache->allow_compat,
+ 				     cache_prev ? cache_prev->allow_compat : NULL,
+ 				     SECCOMP_ARCH_COMPAT_NR,
+ 				     SECCOMP_ARCH_COMPAT);
++	seccomp_cache_prepare_deny(sfilter, cache->deny_compat,
++				   cache_prev ? cache_prev->allow_compat : NULL,
++				   cache_prev ? cache_prev->deny_compat : NULL,
++				   SECCOMP_ARCH_COMPAT_NR,
++				   SECCOMP_ARCH_COMPAT);
+ #endif /* SECCOMP_ARCH_COMPAT */
+ }
+ #endif /* SECCOMP_ARCH_NATIVE */
