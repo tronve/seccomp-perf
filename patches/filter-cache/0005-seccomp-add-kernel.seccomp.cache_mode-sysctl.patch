@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minchan Kwon <tronve@naver.com>
+Date: Thu, 26 Nov 2026 10:29:15 +0000
+Subject: [PATCH] seccomp: add kernel.seccomp.cache_mode sysctl
+
+Add a run-time switch for the caches consulted by seccomp_run_filters():
+0 = none, 1 = allow only (the previous behaviour), 2 = allow and deny
+(the default). The caches are always built when a filter is attached,
+so the switch can be changed at any time.
+
+This makes it possible to compare the caches on the same kernel.
+---
+ kernel/seccomp.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 0c8209050..1d24ce180 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -34,6 +34,12 @@
+ /* Not exposed in headers: strictly internal use only. */
+ #define SECCOMP_MODE_DEAD	(SECCOMP_MODE_FILTER + 1)
+ 
++/*
++ * Which per-filter caches seccomp_run_filters() consults, for comparing
++ * the caches at run time: 0 = none, 1 = allow only, 2 = allow and deny.
++ */
++static int seccomp_cache_mode __read_mostly = 2;
++
+ #ifdef CONFIG_SECCOMP_FILTER
+ #include <linux/file.h>
+ #include <linux/filter.h>
+@@ -485,15 +491,18 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd,
+ 	/* Make sure cross-thread synced filter points somewhere sane. */
+ 	struct seccomp_filter *f =
+ 			READ_ONCE(current->seccomp.filter);
++	int mode;
+ 
+ 	/* Ensure unexpected behavior doesn't result in failing open. */
+ 	if (WARN_ON(f == NULL))
+ 		return SECCOMP_RET_KILL_PROCESS;
+ 
+-	if (seccomp_cache_check_allow(f, sd))
++	mode = READ_ONCE(seccomp_cache_mode);
++
++	if (mode >= 1 && seccomp_cache_check_allow(f, sd))
+ 		return SECCOMP_RET_ALLOW;
+ 
+-	if (seccomp_cache_check_deny(f, sd, &ret, log))
++	if (mode >= 2 && seccomp_cache_check_deny(f, sd, &ret, log))
+ 		return ret;
+ 
+ 	/*
+@@ -2694,6 +2703,15 @@ static const struct ctl_table seccomp_sysctl_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= seccomp_actions_logged_handler,
+ 	},
++	{
++		.procname	= "cache_mode",
++		.data		= &seccomp_cache_mode,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_TWO,
++	},
+ };
+ 
+ static int __init seccomp_sysctl_init(void)
