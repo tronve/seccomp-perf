@@ -1,0 +1,7 @@
+condition  metric                      n         mean       median          min          max
+B0         ops_per_sec                 3    40270.333    40283.000    39887.000    40641.000
+B0         total_time_sec              3       24.833       24.823       24.605       25.070
+B0         usecs_per_op                3       24.833       24.824       24.606       25.070
+B1         ops_per_sec                 3  1035587.000  1041356.000  1019992.000  1045413.000
+B1         total_time_sec              3        0.965        0.960        0.956        0.980
+B1         usecs_per_op                3        0.966        0.960        0.957        0.980
