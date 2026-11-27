@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Minchan Kwon <tronve@naver.com>
+Date: Fri, 27 Nov 2026 03:54:47 +0000
+Subject: [PATCH] seccomp: look up the allow and deny caches with one bounds
+ check
+
+seccomp_cache_check_allow() and seccomp_cache_check_deny() each do their
+own bounds check with array_index_nospec(), so a syscall with a cached
+non-allow result passes the speculation barrier twice. On arm64 this
+barrier is a CSDB instruction, which costs about 6.6ns on our test VM,
+more than running a short filter.
+
+Look up both caches from a single helper after one bounds check. The
+cached results and the speculation protection are unchanged.
+---
+ kernel/seccomp.c | 117 ++++++++++++++++-------------------------------
+ 1 file changed, 40 insertions(+), 77 deletions(-)
+
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 27fa12b75..25aa2e305 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -199,15 +199,9 @@ struct action_cache {
+ #else
+ struct action_cache { };
+ 
+-static inline bool seccomp_cache_check_deny(const struct seccomp_filter *sfilter,
+-					    const struct seccomp_data *sd,
+-					    u32 *ret, bool *log)
+-{
+-	return false;
+-}
+-
+-static inline bool seccomp_cache_check_allow(const struct seccomp_filter *sfilter,
+-					     const struct seccomp_data *sd)
++static inline bool seccomp_cache_check(const struct seccomp_filter *sfilter,
++				       const struct seccomp_data *sd, int mode,
++				       u32 *ret, bool *log)
+ {
+ 	return false;
+ }
+@@ -378,59 +372,21 @@ static int seccomp_check_filter(struct sock_filter *filter, unsigned int flen)
+ }
+ 
+ #ifdef SECCOMP_ARCH_NATIVE
+-static inline bool seccomp_cache_check_allow_bitmap(const void *bitmap,
+-						    size_t bitmap_size,
+-						    int syscall_nr)
+-{
+-	if (unlikely(syscall_nr < 0 || syscall_nr >= bitmap_size))
+-		return false;
+-	syscall_nr = array_index_nospec(syscall_nr, bitmap_size);
+-
+-	return test_bit(syscall_nr, bitmap);
+-}
+-
+-/**
+- * seccomp_cache_check_allow - lookup seccomp cache
+- * @sfilter: The seccomp filter
+- * @sd: The seccomp data to lookup the cache with
+- *
+- * Returns true if the seccomp_data is cached and allowed.
+- */
+-static inline bool seccomp_cache_check_allow(const struct seccomp_filter *sfilter,
+-					     const struct seccomp_data *sd)
+-{
+-	int syscall_nr = sd->nr;
+-	const struct action_cache *cache = &sfilter->cache;
+-
+-#ifndef SECCOMP_ARCH_COMPAT
+-	/* A native-only architecture doesn't need to check sd->arch. */
+-	return seccomp_cache_check_allow_bitmap(cache->allow_native,
+-						SECCOMP_ARCH_NATIVE_NR,
+-						syscall_nr);
+-#else
+-	if (likely(sd->arch == SECCOMP_ARCH_NATIVE))
+-		return seccomp_cache_check_allow_bitmap(cache->allow_native,
+-							SECCOMP_ARCH_NATIVE_NR,
+-							syscall_nr);
+-	if (likely(sd->arch == SECCOMP_ARCH_COMPAT))
+-		return seccomp_cache_check_allow_bitmap(cache->allow_compat,
+-							SECCOMP_ARCH_COMPAT_NR,
+-							syscall_nr);
+-#endif /* SECCOMP_ARCH_COMPAT */
+-
+-	WARN_ON_ONCE(true);
+-	return false;
+-}
+-
+-static inline bool seccomp_cache_check_deny_entry(const struct seccomp_cache_entry *deny,
+-						  size_t size, int syscall_nr,
+-						  u32 *ret, bool *log)
++static inline bool seccomp_cache_check_arch(const unsigned long *allow,
++					    const struct seccomp_cache_entry *deny,
++					    size_t size, int syscall_nr, int mode,
++					    u32 *ret, bool *log)
+ {
+ 	if (unlikely(syscall_nr < 0 || syscall_nr >= size))
+ 		return false;
+ 	syscall_nr = array_index_nospec(syscall_nr, size);
+ 
+-	if (!deny[syscall_nr].valid)
++	if (test_bit(syscall_nr, allow)) {
++		*ret = SECCOMP_RET_ALLOW;
++		return true;
++	}
++
++	if (mode < 2 || !deny[syscall_nr].valid)
+ 		return false;
+ 
+ 	*ret = deny[syscall_nr].ret;
+@@ -439,36 +395,46 @@ static inline bool seccomp_cache_check_deny_entry(const struct seccomp_cache_ent
+ }
+ 
+ /**
+- * seccomp_cache_check_deny - lookup the cached non-allow result
++ * seccomp_cache_check - lookup the cached result of a syscall
+  * @sfilter: The seccomp filter
+  * @sd: The seccomp data to lookup the cache with
++ * @mode: The cache mode, 1 for allow only, 2 for allow and non-allow
+  * @ret: Set to the cached result on a hit
+- * @log: Set to the log flag of the filter that produced @ret on a hit
++ * @log: Set to the log flag of the filter that produced @ret on a
++ *       non-allow hit
+  *
+- * Returns true if the syscall has a cached constant non-allow result.
++ * Both caches are looked up with a single bounds check, so that only one
++ * speculation barrier is needed per syscall.
++ *
++ * Returns true if the syscall has a cached constant result.
+  */
+-static inline bool seccomp_cache_check_deny(const struct seccomp_filter *sfilter,
+-					    const struct seccomp_data *sd,
+-					    u32 *ret, bool *log)
++static inline bool seccomp_cache_check(const struct seccomp_filter *sfilter,
++				       const struct seccomp_data *sd, int mode,
++				       u32 *ret, bool *log)
+ {
+ 	int syscall_nr = sd->nr;
+ 	const struct action_cache *cache = &sfilter->cache;
+ 
+ #ifndef SECCOMP_ARCH_COMPAT
+-	return seccomp_cache_check_deny_entry(cache->deny_native,
+-			      SECCOMP_ARCH_NATIVE_NR,
+-			      syscall_nr, ret, log);
++	/* A native-only architecture doesn't need to check sd->arch. */
++	return seccomp_cache_check_arch(cache->allow_native,
++					cache->deny_native,
++					SECCOMP_ARCH_NATIVE_NR,
++					syscall_nr, mode, ret, log);
+ #else
+ 	if (likely(sd->arch == SECCOMP_ARCH_NATIVE))
+-		return seccomp_cache_check_deny_entry(cache->deny_native,
+-				      SECCOMP_ARCH_NATIVE_NR,
+-				      syscall_nr, ret, log);
++		return seccomp_cache_check_arch(cache->allow_native,
++						cache->deny_native,
++						SECCOMP_ARCH_NATIVE_NR,
++						syscall_nr, mode, ret, log);
+ 	if (likely(sd->arch == SECCOMP_ARCH_COMPAT))
+-		return seccomp_cache_check_deny_entry(cache->deny_compat,
+-				      SECCOMP_ARCH_COMPAT_NR,
+-				      syscall_nr, ret, log);
+-#endif /* SECCOMP_ARCH_COMPAT  */
++		return seccomp_cache_check_arch(cache->allow_compat,
++						cache->deny_compat,
++						SECCOMP_ARCH_COMPAT_NR,
++						syscall_nr, mode, ret, log);
++#endif /* SECCOMP_ARCH_COMPAT */
+ 
++	WARN_ON_ONCE(true);
+ 	return false;
+ }
+ #endif /* SECCOMP_ARCH_NATIVE */
+@@ -499,10 +465,7 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd,
+ 
+ 	mode = READ_ONCE(seccomp_cache_mode);
+ 
+-	if (mode >= 1 && seccomp_cache_check_allow(f, sd))
+-		return SECCOMP_RET_ALLOW;
+-
+-	if (mode >= 2 && seccomp_cache_check_deny(f, sd, &ret, log))
++	if (mode >= 1 && seccomp_cache_check(f, sd, mode, &ret, log))
+ 		return ret;
+ 
+ 	/*
