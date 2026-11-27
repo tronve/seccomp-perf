@@ -1,0 +1,9 @@
+condition  metric                      n         mean       median          min          max
+F2         docker_fork_us             10       48.986       46.840       43.540       67.190
+F2         docker_getppid_ns          10      101.390      100.800      100.500      107.200
+F2         docker_personality_ns      10      141.630      140.700      140.400      145.100
+F2         docker_socket_close_ns     10      636.860      622.650      597.000      733.700
+F2         none_fork_us               10       45.580       44.615       43.040       50.770
+F2         none_getppid_ns            10       82.050       82.000       81.700       82.700
+F2         none_personality_ns        10       81.440       81.400       81.200       82.300
+F2         none_socket_close_ns       10      544.690      526.150      513.700      670.300
