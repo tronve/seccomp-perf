@@ -1,0 +1,8 @@
+condition  metric                      n         mean       median          min          max
+BASE       attach_us@docker           10      509.430      508.550      504.400      516.500
+BASE       attach_us@pad0             10       83.820       83.100       81.700       90.200
+BASE       attach_us@pad100           10      192.510      192.600      191.900      193.100
+BASE       attach_us@pad500           10      576.700      576.900      573.100      579.600
+BASE       attach_us@pad1000          10     1020.650     1018.550     1000.500     1050.200
+BASE       attach_us@pad2000          10     1726.920     1720.900     1702.500     1805.000
+BASE       attach_us@pad4000          10     2853.410     2839.400     2803.500     2943.300
