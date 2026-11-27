@@ -67,7 +67,7 @@ done
 # 조건·지표별 n, 평균, 중앙값, 최소, 최대
 {
 	printf "%-10s %-24s %4s %12s %12s %12s %12s\n" condition metric n mean median min max
-	tail -n +2 "$CSV" | sort -t, -k1,1 -k3,3 -k4,4g | awk -F, '
+	tail -n +2 "$CSV" | sort -t, -k1,1 -k3,3V -k4,4g | awk -F, '
 		function flush() {
 			if (n == 0) return
 			med = (n % 2) ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2

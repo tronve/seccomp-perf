@@ -1,0 +1,4 @@
+# 필터 경로 (거부 캐시). 형식: 이름 sysctl목록(쉼표로 여러 개, 없으면 -) [측정 명령에 붙일 인자...]
+F0 kernel.seccomp.cache_mode=0
+F1 kernel.seccomp.cache_mode=1
+F2 kernel.seccomp.cache_mode=2
