@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: limdaecheol <eocjf852963@gmail.com>
+Date: Sat, 28 Nov 2026 07:21:08 +0000
+Subject: [PATCH] seccomp: record user notification round trip timestamps
+
+A user notification wakes up two tasks in turn: the notifying task
+wakes the listener when it posts the notification, and the listener
+wakes the notifying task when it replies. To decide per direction
+whether waking the peer on the current CPU pays off, the latency of
+each wakeup has to be known first.
+
+Record when and on which CPU a notification is posted, received and
+replied to in struct seccomp_knotif, and when the notifying task wakes
+up again. The receive and wake-up times are taken before notify_lock
+is reacquired so that waiting for the lock is not counted as wakeup
+latency. Also remember when the listener last replied, to tell how
+long it takes to come back for the next notification.
+
+Report the results through two new trace events:
+
+  seccomp:seccomp_notify_recv       gap between the previous reply and
+                                    coming back to receive
+  seccomp:seccomp_notify_roundtrip  post->receive, receive->reply and
+                                    reply->wake-up times with the CPU
+                                    of each step
+
+Round trips interrupted by a signal and replies sent with
+SECCOMP_ADDFD_FLAG_SEND are not reported.
+
+All of this is off by default and enabled with the new
+kernel.seccomp.notif_timing sysctl. It only observes: how either side
+is woken up does not change.
+---
+ MAINTAINERS                    |  1 +
+ include/trace/events/seccomp.h | 82 ++++++++++++++++++++++++++++++++++
+ kernel/seccomp.c               | 82 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 165 insertions(+)
+ create mode 100644 include/trace/events/seccomp.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index e8f06145f..63b55bb75 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -23170,6 +23170,7 @@ S:	Supported
+ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/kees/linux.git for-next/seccomp
+ F:	Documentation/userspace-api/seccomp_filter.rst
+ F:	include/linux/seccomp.h
++F:	include/trace/events/seccomp.h
+ F:	include/uapi/linux/seccomp.h
+ F:	kernel/seccomp.c
+ F:	tools/testing/selftests/kselftest_harness.h
+diff --git a/include/trace/events/seccomp.h b/include/trace/events/seccomp.h
+new file mode 100644
+index 000000000..407568ccc
+--- /dev/null
++++ b/include/trace/events/seccomp.h
+@@ -0,0 +1,82 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM seccomp
++
++#if !defined(_TRACE_SECCOMP_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_SECCOMP_H
++
++#include <linux/tracepoint.h>
++
++/*
++ * The listener picked up a user notification. @gap_ns is the time from its
++ * previous reply until it came back to receive this one (0 if unknown).
++ */
++TRACE_EVENT(seccomp_notify_recv,
++
++	TP_PROTO(u64 id, u64 gap_ns, int cpu),
++
++	TP_ARGS(id, gap_ns, cpu),
++
++	TP_STRUCT__entry(
++		__field(u64, id)
++		__field(u64, gap_ns)
++		__field(int, cpu)
++	),
++
++	TP_fast_assign(
++		__entry->id = id;
++		__entry->gap_ns = gap_ns;
++		__entry->cpu = cpu;
++	),
++
++	TP_printk("id=%llu gap_ns=%llu cpu=%d",
++		  __entry->id, __entry->gap_ns, __entry->cpu)
++);
++
++/*
++ * A user notification round trip finished with a reply.
++ *
++ * @post_ns:  posting the notification -> listener woke up to receive it
++ * @svc_ns:   listener received it -> listener replied
++ * @reply_ns: listener replied -> notifying task woke up
++ */
++TRACE_EVENT(seccomp_notify_roundtrip,
++
++	TP_PROTO(u64 id, u64 post_ns, u64 svc_ns, u64 reply_ns,
++		 int cpu_post, int cpu_recv, int cpu_send, int cpu_wake),
++
++	TP_ARGS(id, post_ns, svc_ns, reply_ns,
++		cpu_post, cpu_recv, cpu_send, cpu_wake),
++
++	TP_STRUCT__entry(
++		__field(u64, id)
++		__field(u64, post_ns)
++		__field(u64, svc_ns)
++		__field(u64, reply_ns)
++		__field(int, cpu_post)
++		__field(int, cpu_recv)
++		__field(int, cpu_send)
++		__field(int, cpu_wake)
++	),
++
++	TP_fast_assign(
++		__entry->id = id;
++		__entry->post_ns = post_ns;
++		__entry->svc_ns = svc_ns;
++		__entry->reply_ns = reply_ns;
++		__entry->cpu_post = cpu_post;
++		__entry->cpu_recv = cpu_recv;
++		__entry->cpu_send = cpu_send;
++		__entry->cpu_wake = cpu_wake;
++	),
++
++	TP_printk("id=%llu post_ns=%llu svc_ns=%llu reply_ns=%llu cpu_post=%d cpu_recv=%d cpu_send=%d cpu_wake=%d",
++		  __entry->id, __entry->post_ns, __entry->svc_ns,
++		  __entry->reply_ns, __entry->cpu_post, __entry->cpu_recv,
++		  __entry->cpu_send, __entry->cpu_wake)
++);
++
++#endif /* _TRACE_SECCOMP_H */
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+diff --git a/kernel/seccomp.c b/kernel/seccomp.c
+index 25f62867a..3d86bb099 100644
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@ -44,6 +44,9 @@
+ #include <linux/anon_inodes.h>
+ #include <linux/lockdep.h>
+ 
++#define CREATE_TRACE_POINTS
++#include <trace/events/seccomp.h>
++
+ /*
+  * When SECCOMP_IOCTL_NOTIF_ID_VALID was first introduced, it had the
+  * wrong direction flag in the ioctl number. This is the broken one,
+@@ -97,6 +100,14 @@ struct seccomp_knotif {
+ 
+ 	/* outstanding addfd requests */
+ 	struct list_head addfd;
++
++	/*
++	 * When (ktime_get_ns(), 0 if not recorded) and on which CPU the
++	 * notification was posted, received and replied to. Only filled in
++	 * while kernel.seccomp.notif_timing is set.
++	 */
++	u64 t_post, t_recv, t_send;
++	int cpu_post, cpu_recv, cpu_send;
+ };
+ 
+ /**
+@@ -144,6 +155,8 @@ struct seccomp_kaddfd {
+  * @flags: A set of SECCOMP_USER_NOTIF_FD_* flags.
+  * @next_id: The id of the next request.
+  * @notifications: A list of struct seccomp_knotif elements.
++ * @last_send: When the most recent reply was sent (ktime_get_ns()), 0 if
++ *             none was recorded. Protected by filter->notify_lock.
+  */
+ 
+ struct notification {
+@@ -151,6 +164,7 @@ struct notification {
+ 	u32 flags;
+ 	u64 next_id;
+ 	struct list_head notifications;
++	u64 last_send;
+ };
+ 
+ #ifdef SECCOMP_ARCH_NATIVE
+@@ -462,6 +476,13 @@ static inline void seccomp_assign_mode(struct task_struct *task,
+ 	set_task_syscall_work(task, SECCOMP);
+ }
+ 
++/*
++ * When set, record when and on which CPU each step of a user notification
++ * round trip happens and report it through the seccomp trace events. This
++ * only observes: it does not change how either side is woken up.
++ */
++static int seccomp_notif_timing __read_mostly;
++
+ #ifdef CONFIG_SECCOMP_FILTER
+ /* Returns 1 if the parent is an ancestor of the child. */
+ static int is_ancestor(struct seccomp_filter *parent,
+@@ -1169,6 +1190,9 @@ static int seccomp_do_user_notification(int this_syscall,
+ 	long ret = 0;
+ 	struct seccomp_knotif n = {};
+ 	struct seccomp_kaddfd *addfd, *tmp;
++	bool timing = READ_ONCE(seccomp_notif_timing);
++	u64 t_wake = 0;
++	int cpu_wake = -1;
+ 
+ 	mutex_lock(&match->notify_lock);
+ 	err = -ENOSYS;
+@@ -1184,6 +1208,10 @@ static int seccomp_do_user_notification(int this_syscall,
+ 	INIT_LIST_HEAD(&n.addfd);
+ 
+ 	atomic_inc(&match->notif->requests);
++	if (timing) {
++		n.cpu_post = raw_smp_processor_id();
++		n.t_post = ktime_get_ns();
++	}
+ 	if (match->notif->flags & SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
+ 		wake_up_poll_on_current_cpu(&match->wqh, EPOLLIN | EPOLLRDNORM);
+ 	else
+@@ -1200,6 +1228,11 @@ static int seccomp_do_user_notification(int this_syscall,
+ 			err = wait_for_completion_killable(&n.ready);
+ 		else
+ 			err = wait_for_completion_interruptible(&n.ready);
++		if (timing) {
++			/* Before taking the lock, to leave out the wait for it. */
++			t_wake = ktime_get_ns();
++			cpu_wake = raw_smp_processor_id();
++		}
+ 		mutex_lock(&match->notify_lock);
+ 
+ 		if (err != 0) {
+@@ -1223,6 +1256,17 @@ static int seccomp_do_user_notification(int this_syscall,
+ 	err = n.error;
+ 	flags = n.flags;
+ 
++	/*
++	 * Only round trips with all four timestamps are reported. A reply
++	 * sent with SECCOMP_ADDFD_FLAG_SEND leaves t_send at 0.
++	 */
++	if (timing && n.t_post && n.t_recv && n.t_send)
++		trace_seccomp_notify_roundtrip(n.id, n.t_recv - n.t_post,
++					       n.t_send - n.t_recv,
++					       t_wake - n.t_send,
++					       n.cpu_post, n.cpu_recv,
++					       n.cpu_send, cpu_wake);
++
+ interrupted:
+ 	/* If there were any pending addfd calls, clear them out */
+ 	list_for_each_entry_safe(addfd, tmp, &n.addfd, list) {
+@@ -1554,6 +1598,9 @@ static long seccomp_notify_recv(struct seccomp_filter *filter,
+ {
+ 	struct seccomp_knotif *knotif = NULL, *cur;
+ 	struct seccomp_notif unotif;
++	bool timing = READ_ONCE(seccomp_notif_timing);
++	u64 t_enter = 0, t_recv = 0;
++	int cpu_recv = -1;
+ 	ssize_t ret;
+ 
+ 	/* Verify that we're not given garbage to keep struct extensible. */
+@@ -1565,10 +1612,19 @@ static long seccomp_notify_recv(struct seccomp_filter *filter,
+ 
+ 	memset(&unotif, 0, sizeof(unotif));
+ 
++	if (timing)
++		t_enter = ktime_get_ns();
++
+ 	ret = recv_wait_event(filter);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (timing) {
++		/* Before taking the lock, to leave out the wait for it. */
++		t_recv = ktime_get_ns();
++		cpu_recv = raw_smp_processor_id();
++	}
++
+ 	mutex_lock(&filter->notify_lock);
+ 	list_for_each_entry(cur, &filter->notif->notifications, list) {
+ 		if (cur->state == SECCOMP_NOTIFY_INIT) {
+@@ -1591,6 +1647,18 @@ static long seccomp_notify_recv(struct seccomp_filter *filter,
+ 	unotif.pid = task_pid_vnr(knotif->task);
+ 	unotif.data = *(knotif->data);
+ 
++	if (timing) {
++		u64 last_send = filter->notif->last_send;
++
++		knotif->t_recv = t_recv;
++		knotif->cpu_recv = cpu_recv;
++		/* How long the listener took to come back for the next one. */
++		trace_seccomp_notify_recv(knotif->id,
++					  last_send && t_enter > last_send ?
++					  t_enter - last_send : 0,
++					  cpu_recv);
++	}
++
+ 	knotif->state = SECCOMP_NOTIFY_SENT;
+ 	wake_up_poll(&filter->wqh, EPOLLOUT | EPOLLWRNORM);
+ 	ret = 0;
+@@ -1660,6 +1728,11 @@ static long seccomp_notify_send(struct seccomp_filter *filter,
+ 	knotif->error = resp.error;
+ 	knotif->val = resp.val;
+ 	knotif->flags = resp.flags;
++	if (READ_ONCE(seccomp_notif_timing)) {
++		knotif->cpu_send = raw_smp_processor_id();
++		knotif->t_send = ktime_get_ns();
++		filter->notif->last_send = knotif->t_send;
++	}
+ 	if (filter->notif->flags & SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
+ 		complete_on_current_cpu(&knotif->ready);
+ 	else
+@@ -2488,6 +2561,15 @@ static int seccomp_actions_logged_handler(const struct ctl_table *ro_table, int
+ }
+ 
+ static const struct ctl_table seccomp_sysctl_table[] = {
++	{
++		.procname	= "notif_timing",
++		.data		= &seccomp_notif_timing,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
+ 	{
+ 		.procname	= "actions_avail",
+ 		.data		= (void *) &seccomp_actions_avail,
